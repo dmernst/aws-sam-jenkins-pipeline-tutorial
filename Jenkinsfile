@@ -1,52 +1,65 @@
 pipeline {
-    agent {
-        docker {
-            image 'node:12' // Use an image with Node.js 12 and compatible glibc pre-installed
-            args '-u root' // Run as root to install additional dependencies if needed
-        }
+    agent any
+    environment {
+        AWS_REGION = 'us-east-1'
+        ECR_REPO = "${params.AWS_account_number}.dkr.ecr.${AWS_REGION}.amazonaws.com/loadtest-dltecsdltecr2419f66f-udaavaeude24"
+        ECS_CLUSTER = 'jenkins-demo'
+        ECS_SERVICE = 'jenkins-demo-service'
     }
     stages {
-        stage('Install sam-cli') {
-            steps {
-                sh 'npm install -g npm@latest-12' // Update npm within the container
-                sh 'python3 -m venv venv && venv/bin/pip install aws-sam-cli'
-                stash includes: '**/venv/**/*', name: 'venv'
-            }
-        }
         stage('Build') {
             steps {
-                unstash 'venv'
-                sh 'venv/bin/sam build'
-                stash includes: '**/.aws-sam/**/*', name: 'aws-sam'
+                echo "Building a minimal Docker image with scratch as the base..."
+                echo "Creating a minimal C program file"
+                
+                sh '''
+                  cat > hello.c << EOF
+                  #include <stdio.h>
+                  int main() {
+                      printf("Hello, World!\\n");
+                      return 0;
+                  }
+EOF
+                '''
+                
+                sh 'gcc -o hello hello.c'
+                
+                echo "Creating Dockerfile for minimal image"
+                sh '''
+                  cat > Dockerfile << EOF
+                  FROM scratch
+                  COPY hello /
+                  CMD ["/hello"]
+EOF
+                '''
             }
         }
-        stage('beta') {
-            environment {
-                STACK_NAME = 'sam-app-beta-stage'
-                S3_BUCKET = 'sam-jenkins-demo-us-west-2-dmernst'
-            }
+        stage('Dockerize') {
             steps {
-                withAWS(credentials: 'sam-jenkins-demo-credentials', region: 'us-west-2') {
-                    unstash 'venv'
-                    unstash 'aws-sam'
-                    sh 'venv/bin/sam deploy --stack-name $STACK_NAME -t template.yaml --s3-bucket $S3_BUCKET --capabilities CAPABILITY_IAM'
-                    dir ('hello-world') {
-                        sh 'npm ci'
-                        sh 'npm run integ-test'
-                    }
+                echo "Creating Docker image from scratch"
+                sh 'docker build -t my-dummy-image .'
+            }
+        }
+        stage('Push') {
+            steps {
+                echo "Pushing Docker image to repository"
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS-creds']]) {
+                    sh 'aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO'
                 }
+                sh 'docker tag my-dummy-image $ECR_REPO:latest'
+                sh 'docker push $ECR_REPO:latest'
             }
         }
-        stage('prod') {
-            environment {
-                STACK_NAME = 'sam-app-prod-stage'
-                S3_BUCKET = 'sam-jenkins-demo-us-east-1-dmernst'
-            }
+        stage('Deploy') {
             steps {
-                withAWS(credentials: 'sam-jenkins-demo-credentials', region: 'us-east-1') {
-                    unstash 'venv'
-                    unstash 'aws-sam'
-                    sh 'venv/bin/sam deploy --stack-name $STACK_NAME -t template.yaml --s3-bucket $S3_BUCKET --capabilities CAPABILITY_IAM'
+                echo "Deploying to ECS service"
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS-creds']]) {
+                    sh '''
+                    aws ecs update-service --cluster $ECS_CLUSTER \
+                    --service $ECS_SERVICE \
+                    --force-new-deployment \
+                    --region $AWS_REGION
+                    '''
                 }
             }
         }
